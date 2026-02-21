@@ -64,7 +64,7 @@ def execute_training(model, optimizer, loaders, device, epochs=5):
             batch = {k: v.to(device) for k, v in batch.items()}
             optimizer.zero_grad()
             s_risk, g_risk = model(batch)
-            loss = build_train_model.risk_velocity_loss(s_risk, g_risk, batch['label'], batch['mask'])
+            loss = build_train_model.risk_velocity_loss(s_risk, g_risk, batch['label'], batch['mask'], batch['step_targets'])
             loss.backward()
             grad = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
@@ -78,7 +78,7 @@ def execute_training(model, optimizer, loaders, device, epochs=5):
             for i, batch in enumerate(loaders['val']):
                 batch = {k: v.to(device) for k, v in batch.items()}
                 s_risk, g_risk = model(batch)
-                val_sum += build_train_model.risk_velocity_loss(s_risk, g_risk, batch['label'], batch['mask']).item()
+                val_sum += build_train_model.risk_velocity_loss(s_risk, g_risk, batch['label'], batch['mask'], batch['step_targets']).item()
                 if i == 0:
                     labels, masks = batch['label'].cpu().numpy(), batch['mask'].cpu().numpy()
                     risks = s_risk.cpu().numpy()
