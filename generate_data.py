@@ -9,10 +9,12 @@ LOCS_PER_AREA = 10
 START_DATE = datetime.datetime(2025, 1, 1)
 DAYS_TO_SIMULATE = 5
 PACKAGES_PER_DAY = 5000
-FAILURE_RATE = 0.15
+ANOMALY_RATE = 0.15
+# Backward-compatible alias. This controls anomaly injection, not final FailedService rate.
+FAILURE_RATE = ANOMALY_RATE
 
 COMMIT_DAYS_SAME_AREA = 1
-COMMIT_DAYS_CROSS_AREA = 2
+COMMIT_DAYS_CROSS_AREA = 1
 
 # Failure Modes (Used to inject anomalies)
 ROOT_CAUSE_PROBS = {
@@ -78,7 +80,7 @@ def simulate_package_journey(pkg_id, origin, dest, pickup_date, loc_registry):
     commit_date = (pickup_date + timedelta(days=transit_days)).date()
 
     # Failure setup
-    will_fail = np.random.random() < FAILURE_RATE
+    will_fail = np.random.random() < ANOMALY_RATE
     cause = np.random.choice(
         list(ROOT_CAUSE_PROBS.keys()), p=list(ROOT_CAUSE_PROBS.values())
     ) if will_fail else "NONE"
@@ -112,7 +114,8 @@ def simulate_package_journey(pkg_id, origin, dest, pickup_date, loc_registry):
         if not is_origin:
             transit_hours = np.random.randint(3, 9)
             if is_trigger_facility and cause == 'LATE_ARRIVAL':
-                transit_hours += np.random.randint(30, 61)
+                # Minutes, not hours: late-arrival misses planned departure windows.
+                curr_time += timedelta(minutes=np.random.randint(480, 961))
             curr_time += timedelta(hours=transit_hours)
 
         for scan_idx, scan_event in enumerate(facility_scans):
@@ -122,9 +125,9 @@ def simulate_package_journey(pkg_id, origin, dest, pickup_date, loc_registry):
                 # YARD_DELAY / CAPACITY_FAIL: large delay between 1st and 2nd scan
                 if is_trigger_facility and scan_idx == 1:
                     if cause == 'YARD_DELAY':
-                        intra_delay += np.random.randint(600, 1200)
+                        intra_delay += np.random.randint(720, 1441)
                     elif cause == 'CAPACITY_FAIL':
-                        intra_delay += np.random.randint(480, 720)
+                        intra_delay += np.random.randint(600, 1321)
                 curr_time += timedelta(minutes=intra_delay)
 
             lane_id = f"LANE_{loc_id}_{np.random.randint(1, 10)}"
@@ -132,7 +135,8 @@ def simulate_package_journey(pkg_id, origin, dest, pickup_date, loc_registry):
             # MISLOAD: wrong lane on trailer_load_scan + extra delay
             if is_trigger_facility and cause == 'MISLOAD' and scan_event == 'trailer_load_scan':
                 lane_id = "LANE_ERROR_999"
-                curr_time += timedelta(minutes=np.random.randint(180, 420))
+                # Misload requires re-handling and trailer reassignment.
+                curr_time += timedelta(minutes=np.random.randint(960, 1801))
 
             # Determine trigger scan for step-level labels
             is_trigger_scan = False
@@ -191,8 +195,12 @@ def run_simulation():
 
     df_packages = delivered[['PackageID', 'FailedService', 'Commit_Date', 'Destination']].copy()
 
-    # Build trigger_info for step-level labels
-    triggers = df_scans[df_scans['Is_Failure_Trigger'] == 1][['PackageID', 'ScanTime']].copy()
+    # Build trigger_info for failed-service packages only.
+    # This aligns step supervision with the root-cause-of-failure objective.
+    failed_pkg_ids = set(df_packages.loc[df_packages['FailedService'] == 1, 'PackageID'])
+    triggers = df_scans[
+        (df_scans['Is_Failure_Trigger'] == 1) & (df_scans['PackageID'].isin(failed_pkg_ids))
+    ][['PackageID', 'ScanTime']].copy()
     triggers = triggers.rename(columns={'ScanTime': 'Trigger_Time'})
     trigger_info = triggers.groupby('PackageID').first().reset_index()
 

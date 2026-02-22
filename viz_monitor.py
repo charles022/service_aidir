@@ -24,7 +24,7 @@ class DarkMonitor:
         ax1 = self.fig.add_subplot(gs[0, 0])
         ax1.plot(self.epoch_data['train'], 'o-', color=COLORS[0], label='Train')
         ax1.plot(self.epoch_data['val'], 'o-', color=COLORS[1], label='Val')
-        ax1.legend(); ax1.set_title("Binary Cross Entropy Loss")
+        ax1.legend(); ax1.set_title("Total Training Loss")
         
         ax2 = self.fig.add_subplot(gs[0, 1])
         if len(self.step_data['loss']) > 10:
@@ -57,6 +57,7 @@ class DarkMonitor:
 
 def execute_training(model, optimizer, loaders, device, epochs=5):
     monitor = DarkMonitor()
+    loss_cfg = loaders.get('loss_cfg', {})
     for epoch in range(epochs):
         model.train()
         train_sum = 0
@@ -64,7 +65,9 @@ def execute_training(model, optimizer, loaders, device, epochs=5):
             batch = {k: v.to(device) for k, v in batch.items()}
             optimizer.zero_grad()
             s_risk, g_risk = model(batch)
-            loss = build_train_model.risk_velocity_loss(s_risk, g_risk, batch['label'], batch['mask'], batch['step_targets'])
+            loss = build_train_model.risk_velocity_loss(
+                s_risk, g_risk, batch['label'], batch['mask'], batch['step_targets'], **loss_cfg
+            )
             loss.backward()
             grad = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
@@ -78,7 +81,9 @@ def execute_training(model, optimizer, loaders, device, epochs=5):
             for i, batch in enumerate(loaders['val']):
                 batch = {k: v.to(device) for k, v in batch.items()}
                 s_risk, g_risk = model(batch)
-                val_sum += build_train_model.risk_velocity_loss(s_risk, g_risk, batch['label'], batch['mask'], batch['step_targets']).item()
+                val_sum += build_train_model.risk_velocity_loss(
+                    s_risk, g_risk, batch['label'], batch['mask'], batch['step_targets'], **loss_cfg
+                ).item()
                 if i == 0:
                     labels, masks = batch['label'].cpu().numpy(), batch['mask'].cpu().numpy()
                     risks = s_risk.cpu().numpy()

@@ -12,7 +12,7 @@ class DCLTConfig:
         self.num_locs = num_locs
         self.num_events = num_events
         self.num_lanes = num_lanes
-        self.context_in_dim = 2
+        self.context_in_dim = 3
         self.d_model = 256
         self.nhead = 8
         self.num_layers = 6
@@ -40,10 +40,10 @@ class DeepContextualLogisticsTransformer(nn.Module):
     def __init__(self, config):
         super().__init__()
         # Embeddings
-        self.emb_loc = nn.Embedding(config.num_locs, 64)
-        self.emb_event = nn.Embedding(config.num_events, 32)
-        self.emb_lane = nn.Embedding(config.num_lanes, 32)
-        self.emb_dest = nn.Embedding(config.num_locs, 64)
+        self.emb_loc = nn.Embedding(config.num_locs, 64, padding_idx=0)
+        self.emb_event = nn.Embedding(config.num_events, 32, padding_idx=0)
+        self.emb_lane = nn.Embedding(config.num_lanes, 32, padding_idx=0)
+        self.emb_dest = nn.Embedding(config.num_locs, 64, padding_idx=0)
 
         # Time & Context
         self.time_encoder = CyclicalTimeEncoder(out_dim=64)
@@ -76,28 +76,36 @@ class DeepContextualLogisticsTransformer(nn.Module):
         step_risk = self.step_head(out).squeeze(-1)
 
         # Global pooling (Max Risk strategy)
-        masked_out = out * (~batch['mask'].unsqueeze(-1))
+        masked_out = out.masked_fill(batch['mask'].unsqueeze(-1), -1e9)
         global_pool, _ = torch.max(masked_out, dim=1)
         global_risk = self.global_head(global_pool).squeeze(-1)
 
         return step_risk, global_risk
 
 # --- SUPERVISED LOSS ---
-def risk_velocity_loss(step_risk, global_risk, target, mask, step_targets):
+def risk_velocity_loss(step_risk, global_risk, target, mask, step_targets, global_pos_weight=1.0, step_pos_weight=1.0, mono_weight=0.5):
+    eps = 1e-6
+
     # 1. Global BCE
-    loss_global = F.binary_cross_entropy(global_risk, target)
+    global_weight = torch.where(target > 0.5, torch.full_like(target, float(global_pos_weight)), torch.ones_like(target))
+    loss_global = F.binary_cross_entropy(global_risk.clamp(eps, 1.0 - eps), target, weight=global_weight)
 
     # 2. Explicit step-level BCE (masked)
     valid_mask = (~mask).float()
     num_valid = valid_mask.sum().clamp(min=1.0)
-    step_bce = F.binary_cross_entropy(step_risk, step_targets, reduction='none')
+    step_weight = torch.where(step_targets > 0.5, torch.full_like(step_targets, float(step_pos_weight)), torch.ones_like(step_targets))
+    step_bce = F.binary_cross_entropy(step_risk.clamp(eps, 1.0 - eps), step_targets, reduction='none')
+    step_bce = step_bce * step_weight
     loss_step = (step_bce * valid_mask).sum() / num_valid
 
-    # 3. Monotonicity (risk shouldn't drop)
-    valid_step = step_risk * valid_mask
-    loss_mono = torch.mean(F.relu(-(valid_step[:, 1:] - valid_step[:, :-1])))
+    # 3. Monotonicity (risk shouldn't drop) over valid adjacent pairs only.
+    pair_mask = (~mask[:, 1:]) & (~mask[:, :-1])
+    pair_weight = pair_mask.float()
+    num_pairs = pair_weight.sum().clamp(min=1.0)
+    step_diff = step_risk[:, 1:] - step_risk[:, :-1]
+    loss_mono = (F.relu(-step_diff) * pair_weight).sum() / num_pairs
 
-    return loss_global + loss_step + (0.5 * loss_mono)
+    return loss_global + loss_step + (mono_weight * loss_mono)
 
 # --- DATASET ---
 class LogisticsDataset(Dataset):
@@ -124,6 +132,7 @@ class LogisticsDataset(Dataset):
 
         pkg_label = self.labels[pkg_id]
         commit_date = self.commit_dates[pkg_id]
+        commit_deadline = pd.Timestamp(commit_date) + pd.Timedelta(hours=23, minutes=59, seconds=59)
         dest_id = self.maps['loc'].get(self.destinations[pkg_id], 0)
 
         trigger_time = self.trigger_times.get(pkg_id, None)
@@ -132,9 +141,14 @@ class LogisticsDataset(Dataset):
 
         locs, events, lanes, dests, hours, days, ctx, step_labels = [], [], [], [], [], [], [], []
         prev_time = None
+        pickup_time = None
+        seq_total = len(journey)
 
-        for _, row in journey.iterrows():
+        for step_idx, (_, row) in enumerate(journey.iterrows()):
             curr = pd.to_datetime(row['ScanTime'])
+            if pickup_time is None:
+                pickup_time = curr
+
             locs.append(self.maps['loc'].get(row['LocationID'], 0))
             events.append(self.maps['event'].get(row['Event'], 0))
             lanes.append(self.maps['lane'].get(row.get('LaneID', 'NONE'), 0))
@@ -145,17 +159,18 @@ class LogisticsDataset(Dataset):
             # Context features
             delta = (curr - prev_time).total_seconds() / 3600.0 if prev_time else 0.0
             prev_time = curr
-            days_until_commit = (commit_date - curr.date()).days
-            ctx.append([delta, float(days_until_commit)])
+            hours_until_commit = (commit_deadline - curr).total_seconds() / 3600.0
+            hours_since_pickup = (curr - pickup_time).total_seconds() / 3600.0
+            ctx.append([delta, hours_until_commit, hours_since_pickup])
 
             # Step-level labels
-            if pkg_label == 0:
-                step_labels.append(0.0)
+            if pkg_label == 1 and trigger_time is not None:
+                step_labels.append(1.0 if curr >= trigger_time else 0.0)
+            elif pkg_label == 1:
+                # Rare fallback when a failed package has no trigger info.
+                step_labels.append(1.0 if step_idx >= (seq_total - 1) else 0.0)
             else:
-                if trigger_time is not None:
-                    step_labels.append(1.0 if curr >= trigger_time else 0.0)
-                else:
-                    step_labels.append(1.0)
+                step_labels.append(0.0)
 
         # Padding
         seq_len = len(locs)
@@ -167,7 +182,7 @@ class LogisticsDataset(Dataset):
             dests += [0] * pad
             hours += [0.0] * pad
             days += [0.0] * pad
-            ctx += [[0.0] * 2] * pad
+            ctx += [[0.0] * 3] * pad
             step_labels += [0.0] * pad
             mask = [False] * seq_len + [True] * pad
         else:
@@ -183,13 +198,13 @@ class LogisticsDataset(Dataset):
             mask = [False] * limit
 
         return {
-            'locs': torch.tensor(locs),
-            'events': torch.tensor(events),
-            'lanes': torch.tensor(lanes),
-            'dests': torch.tensor(dests),
-            'hours': torch.tensor(hours),
-            'days': torch.tensor(days),
-            'context': torch.tensor(ctx),
+            'locs': torch.tensor(locs, dtype=torch.long),
+            'events': torch.tensor(events, dtype=torch.long),
+            'lanes': torch.tensor(lanes, dtype=torch.long),
+            'dests': torch.tensor(dests, dtype=torch.long),
+            'hours': torch.tensor(hours, dtype=torch.float32),
+            'days': torch.tensor(days, dtype=torch.float32),
+            'context': torch.tensor(ctx, dtype=torch.float32),
             'mask': torch.tensor(mask, dtype=torch.bool),
             'label': torch.tensor(self.labels[pkg_id], dtype=torch.float32),
             'step_targets': torch.tensor(step_labels, dtype=torch.float32),
@@ -200,34 +215,77 @@ def setup_system(packages_df, scans_df, trigger_info=None):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     maps = {
-        'loc': {l: i for i, l in enumerate(scans_df['LocationID'].unique())},
-        'event': {e: i for i, e in enumerate(scans_df['Event'].unique())},
-        'lane': {l: i for i, l in enumerate(scans_df['LaneID'].fillna('NONE').unique())}
+        'loc': {l: i for i, l in enumerate(scans_df['LocationID'].unique(), start=1)},
+        'event': {e: i for i, e in enumerate(scans_df['Event'].unique(), start=1)},
+        'lane': {l: i for i, l in enumerate(scans_df['LaneID'].fillna('NONE').unique(), start=1)}
     }
 
-    pids = packages_df['PackageID'].unique()
-    split = int(len(pids) * 0.8)
-    train_ids, val_ids = pids[:split], pids[split:]
+    # Stratified split for stable train/val class balance.
+    rng = np.random.default_rng(42)
+    failed = np.asarray(packages_df[packages_df['FailedService'] == 1]['PackageID'].unique(), dtype=object)
+    success = np.asarray(packages_df[packages_df['FailedService'] == 0]['PackageID'].unique(), dtype=object)
+    rng.shuffle(failed)
+    rng.shuffle(success)
+
+    fail_split = int(len(failed) * 0.8)
+    success_split = int(len(success) * 0.8)
+
+    train_ids = np.concatenate([failed[:fail_split], success[:success_split]])
+    val_ids = np.concatenate([failed[fail_split:], success[success_split:]])
+    rng.shuffle(train_ids)
+    rng.shuffle(val_ids)
 
     print(f"Supervised Training on {len(train_ids)} packages (Mixed Success/Failure)")
 
+    train_pkg_df = packages_df[packages_df['PackageID'].isin(train_ids)]
+    val_pkg_df = packages_df[packages_df['PackageID'].isin(val_ids)]
+    train_scans_df = scans_df[scans_df['PackageID'].isin(train_ids)]
+    val_scans_df = scans_df[scans_df['PackageID'].isin(val_ids)]
+
     train_ds = LogisticsDataset(
-        packages_df[packages_df['PackageID'].isin(train_ids)],
-        scans_df[scans_df['PackageID'].isin(train_ids)],
+        train_pkg_df,
+        train_scans_df,
         trigger_info, maps
     )
     val_ds = LogisticsDataset(
-        packages_df[packages_df['PackageID'].isin(val_ids)],
-        scans_df[scans_df['PackageID'].isin(val_ids)],
+        val_pkg_df,
+        val_scans_df,
         trigger_info, maps
     )
 
-    loaders = {
-        'train': DataLoader(train_ds, batch_size=32, shuffle=True),
-        'val': DataLoader(val_ds, batch_size=32)
+    train_fail_rate = float(train_pkg_df['FailedService'].mean())
+    global_pos_weight = (1.0 - train_fail_rate) / max(train_fail_rate, 1e-6)
+    global_pos_weight = max(1.0, global_pos_weight)
+
+    if trigger_info is not None and len(trigger_info) > 0:
+        train_trigger_df = trigger_info[trigger_info['PackageID'].isin(train_ids)].copy()
+        if len(train_trigger_df) > 0:
+            step_base = train_scans_df[['PackageID', 'ScanTime']].copy()
+            step_base['ScanTime'] = pd.to_datetime(step_base['ScanTime'])
+            train_trigger_df['Trigger_Time'] = pd.to_datetime(train_trigger_df['Trigger_Time'])
+            step_merge = step_base.merge(train_trigger_df, on='PackageID', how='left')
+            step_pos = ((~step_merge['Trigger_Time'].isna()) & (step_merge['ScanTime'] >= step_merge['Trigger_Time'])).sum()
+            step_total = len(step_merge)
+            step_neg = step_total - step_pos
+            step_pos_weight = max(1.0, float(step_neg) / max(float(step_pos), 1.0))
+        else:
+            step_pos_weight = 1.0
+    else:
+        step_pos_weight = 1.0
+
+    loss_cfg = {
+        'global_pos_weight': float(global_pos_weight),
+        'step_pos_weight': float(step_pos_weight),
+        'mono_weight': 0.5,
     }
 
-    config = DCLTConfig(len(maps['loc']), len(maps['event']), len(maps['lane']))
+    loaders = {
+        'train': DataLoader(train_ds, batch_size=32, shuffle=True),
+        'val': DataLoader(val_ds, batch_size=32),
+        'loss_cfg': loss_cfg,
+    }
+
+    config = DCLTConfig(len(maps['loc']) + 1, len(maps['event']) + 1, len(maps['lane']) + 1)
     model = DeepContextualLogisticsTransformer(config).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
 
