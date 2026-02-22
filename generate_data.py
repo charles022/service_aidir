@@ -7,7 +7,7 @@ from datetime import timedelta
 NUM_AREAS = 10
 LOCS_PER_AREA = 10
 START_DATE = datetime.datetime(2025, 1, 1)
-DAYS_TO_SIMULATE = 5 
+DAYS_TO_SIMULATE = 14
 PACKAGES_PER_DAY = 5000 
 FAILURE_RATE = 0.15   
 
@@ -99,7 +99,8 @@ def simulate_package_journey(pkg_id, origin, dest, pickup_date, calendar, loc_re
             'LaneID': lane_id, 
             'Sort_Connection_Mins': sort_connection_time, 'Time_To_Cut_Mins': time_to_cut, 'Facility_Load': facility_load,               
             'Is_Failure_Trigger': 1 if is_trigger_scan else 0,
-            'Root_Cause_Type': cause if is_trigger_scan else 'NONE'
+            'Root_Cause_Type': cause if is_trigger_scan else 'NONE',
+            'StartDay': (pickup_date - START_DATE).days # Track day index
         })
         curr_time += timedelta(hours=np.random.randint(2, 5))
 
@@ -127,7 +128,8 @@ def run_simulation():
             
     df_scans = pd.DataFrame(all_scans)
     df_packages = df_scans.groupby('PackageID').agg({
-        'Is_Failure_Trigger': 'max' # Binary label for the whole package
+        'Is_Failure_Trigger': 'max',
+        'StartDay': 'first'
     }).reset_index().rename(columns={'Is_Failure_Trigger': 'FailedService'})
     
     return df_packages, df_scans, None, None

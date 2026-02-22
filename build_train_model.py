@@ -12,11 +12,11 @@ class DCLTConfig:
         self.num_locs = num_locs
         self.num_events = num_events
         self.num_lanes = num_lanes
-        self.cont_dim = 64
-        self.d_model = 256
-        self.nhead = 8
-        self.num_layers = 6
-        self.dropout = 0.1
+        self.cont_dim = 32
+        self.d_model = 128
+        self.nhead = 4
+        self.num_layers = 3
+        self.dropout = 0.2
 
 # --- COMPONENTS ---
 class CyclicalTimeEncoder(nn.Module):
@@ -50,8 +50,9 @@ class DeepContextualLogisticsTransformer(nn.Module):
         
         # Fusion & Transformer
         self.fusion = nn.Linear(256, config.d_model)
+        self.dropout = nn.Dropout(config.dropout)
         self.pos_encoder = nn.Parameter(torch.zeros(1, 128, config.d_model))
-        enc_layer = nn.TransformerEncoderLayer(d_model=config.d_model, nhead=config.nhead, dim_feedforward=1024, batch_first=True, activation='gelu', norm_first=True)
+        enc_layer = nn.TransformerEncoderLayer(d_model=config.d_model, nhead=config.nhead, dim_feedforward=512, dropout=config.dropout, batch_first=True, activation='gelu', norm_first=True)
         self.transformer = nn.TransformerEncoder(enc_layer, num_layers=config.num_layers)
         
         # HEADS
@@ -68,6 +69,7 @@ class DeepContextualLogisticsTransformer(nn.Module):
         ], dim=-1)
         x = self.fusion(x)
         x = x + self.pos_encoder[:, :x.size(1), :]
+        x = self.dropout(x)
         
         out = self.transformer(x, src_key_padding_mask=batch['mask'])
         
@@ -152,20 +154,26 @@ def setup_system(packages_df, scans_df, calendar_df):
         'lane': {l:i for i,l in enumerate(scans_df['LaneID'].fillna('NONE').unique())}
     }
     
-    # Train on EVERYTHING (Success + Failure)
-    pids = packages_df['PackageID'].unique()
-    split = int(len(pids) * 0.8)
-    train_ids, val_ids = pids[:split], pids[split:]
+    # Temporal Split: Train on first 11 days (0-10), Val on rest (11+)
+    # This requires 'StartDay' in packages_df
+    split_day = 11
+    train_df = packages_df[packages_df['StartDay'] < split_day]
+    val_df = packages_df[packages_df['StartDay'] >= split_day]
     
-    print(f"Supervised Training on {len(train_ids)} packages (Mixed Success/Failure)")
+    print(f"Temporal Split Strategy: Train (Days 0-{split_day-1}) vs Val (Days {split_day}+)")
+    print(f"Training Packages: {len(train_df)} | Validation Packages: {len(val_df)}")
     
-    train_ds = LogisticsDataset(packages_df[packages_df['PackageID'].isin(train_ids)], scans_df[scans_df['PackageID'].isin(train_ids)], None, maps)
-    val_ds = LogisticsDataset(packages_df[packages_df['PackageID'].isin(val_ids)], scans_df[scans_df['PackageID'].isin(val_ids)], None, maps)
+    train_ids = train_df['PackageID'].unique()
+    val_ids = val_df['PackageID'].unique()
     
-    loaders = {'train': DataLoader(train_ds, batch_size=32, shuffle=True), 'val': DataLoader(val_ds, batch_size=32)}
+    train_ds = LogisticsDataset(train_df, scans_df[scans_df['PackageID'].isin(train_ids)], None, maps)
+    val_ds = LogisticsDataset(val_df, scans_df[scans_df['PackageID'].isin(val_ids)], None, maps)
+    
+    loaders = {'train': DataLoader(train_ds, batch_size=128, shuffle=True), 'val': DataLoader(val_ds, batch_size=128)}
     
     config = DCLTConfig(len(maps['loc']), len(maps['event']), len(maps['lane']))
     model = DeepContextualLogisticsTransformer(config).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=0.01)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=3, gamma=0.1)
     
-    return model, optimizer, loaders, device
+    return model, optimizer, loaders, device, scheduler

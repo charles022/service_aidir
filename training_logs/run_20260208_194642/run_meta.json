@@ -1,0 +1,11 @@
+{
+    "timestamp": "20260208_194642",
+    "device": "NVIDIA GeForce RTX 3060 Ti",
+    "model_config": {
+        "description": "Temporal Split Config (d_model=128, layers=3, dropout=0.2)",
+        "cont_dim": 32,
+        "d_model": 128,
+        "nhead": 4,
+        "num_layers": 3
+    }
+}

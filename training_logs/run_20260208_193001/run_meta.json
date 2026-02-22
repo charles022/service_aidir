@@ -1,0 +1,11 @@
+{
+    "timestamp": "20260208_193001",
+    "device": "NVIDIA GeForce RTX 3060 Ti",
+    "model_config": {
+        "description": "Optimized Config (d_model=64, layers=2, dropout=0.2)",
+        "cont_dim": 32,
+        "d_model": 64,
+        "nhead": 4,
+        "num_layers": 2
+    }
+}
