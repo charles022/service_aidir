@@ -40,9 +40,9 @@ class DeepContextualLogisticsTransformer(nn.Module):
     def __init__(self, config):
         super().__init__()
         # Embeddings
-        self.emb_loc = nn.Embedding(config.num_locs, 64)
-        self.emb_event = nn.Embedding(config.num_events, 32)
-        self.emb_lane = nn.Embedding(config.num_lanes, 32)
+        self.emb_loc = nn.Embedding(config.num_locs, 64, padding_idx=0)
+        self.emb_event = nn.Embedding(config.num_events, 32, padding_idx=0)
+        self.emb_lane = nn.Embedding(config.num_lanes, 32, padding_idx=0)
         
         # Physics
         self.time_encoder = CyclicalTimeEncoder(out_dim=64)
@@ -76,26 +76,54 @@ class DeepContextualLogisticsTransformer(nn.Module):
         step_risk = self.step_head(out).squeeze(-1)
         
         # Global pooling (Max Risk strategy)
-        masked_out = out * (~batch['mask'].unsqueeze(-1))
+        masked_out = out.masked_fill(batch['mask'].unsqueeze(-1), -1e9)
         global_pool, _ = torch.max(masked_out, dim=1)
         global_risk = self.global_head(global_pool).squeeze(-1)
         
         return step_risk, global_risk
 
 # --- SUPERVISED LOSS (Risk Velocity) ---
-def risk_velocity_loss(step_risk, global_risk, target, mask):
-    # 1. Global Accuracy
-    loss_global = F.binary_cross_entropy(global_risk, target)
-    
-    # 2. Weak Supervision (Max step risk should match target)
-    valid_step = step_risk * (~mask)
+def risk_velocity_loss(
+    step_risk,
+    global_risk,
+    target,
+    mask,
+    global_pos_weight=1.0,
+    step_pos_weight=1.0,
+    mono_weight=0.5,
+):
+    eps = 1e-6
+
+    # 1. Global Accuracy with optional positive-class upweighting
+    global_weight = torch.where(
+        target > 0.5,
+        torch.full_like(target, float(global_pos_weight)),
+        torch.ones_like(target),
+    )
+    loss_global = F.binary_cross_entropy(
+        global_risk.clamp(eps, 1.0 - eps), target, weight=global_weight
+    )
+
+    # 2. Weak Supervision: max valid step risk should match package label
+    valid_step = step_risk.masked_fill(mask, -1e9)
     max_step, _ = torch.max(valid_step, dim=1)
-    loss_step_max = F.binary_cross_entropy(max_step, target)
-    
-    # 3. Monotonicity (Risk shouldn't drop without reason)
-    loss_mono = torch.mean(F.relu(-(valid_step[:, 1:] - valid_step[:, :-1])))
-    
-    return loss_global + loss_step_max + (0.5 * loss_mono)
+    step_weight = torch.where(
+        target > 0.5,
+        torch.full_like(target, float(step_pos_weight)),
+        torch.ones_like(target),
+    )
+    loss_step_max = F.binary_cross_entropy(
+        max_step.clamp(eps, 1.0 - eps), target, weight=step_weight
+    )
+
+    # 3. Monotonicity over valid adjacent pairs only
+    pair_mask = (~mask[:, 1:]) & (~mask[:, :-1])
+    pair_weight = pair_mask.float()
+    num_pairs = pair_weight.sum().clamp(min=1.0)
+    step_diff = step_risk[:, 1:] - step_risk[:, :-1]
+    loss_mono = (F.relu(-step_diff) * pair_weight).sum() / num_pairs
+
+    return loss_global + loss_step_max + (mono_weight * loss_mono)
 
 # --- DATASET ---
 class LogisticsDataset(Dataset):
@@ -139,8 +167,12 @@ class LogisticsDataset(Dataset):
             locs=locs[:limit]; events=events[:limit]; lanes=lanes[:limit]; hours=hours[:limit]; days=days[:limit]; ctx=ctx[:limit]; mask=[False]*limit
 
         return {
-            'locs': torch.tensor(locs), 'events': torch.tensor(events), 'lanes': torch.tensor(lanes),
-            'hours': torch.tensor(hours), 'days': torch.tensor(days), 'context': torch.tensor(ctx),
+            'locs': torch.tensor(locs, dtype=torch.long),
+            'events': torch.tensor(events, dtype=torch.long),
+            'lanes': torch.tensor(lanes, dtype=torch.long),
+            'hours': torch.tensor(hours, dtype=torch.float32),
+            'days': torch.tensor(days, dtype=torch.float32),
+            'context': torch.tensor(ctx, dtype=torch.float32),
             'mask': torch.tensor(mask, dtype=torch.bool), 'label': torch.tensor(self.labels[pkg_id], dtype=torch.float32)
         }
 
@@ -149,9 +181,9 @@ def setup_system(packages_df, scans_df, calendar_df):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     maps = {
-        'loc': {l:i for i,l in enumerate(scans_df['LocationID'].unique())},
-        'event': {e:i for i,e in enumerate(scans_df['Event'].unique())},
-        'lane': {l:i for i,l in enumerate(scans_df['LaneID'].fillna('NONE').unique())}
+        'loc': {l:i for i,l in enumerate(scans_df['LocationID'].unique(), start=1)},
+        'event': {e:i for i,e in enumerate(scans_df['Event'].unique(), start=1)},
+        'lane': {l:i for i,l in enumerate(scans_df['LaneID'].fillna('NONE').unique(), start=1)}
     }
     
     # Temporal Split: Train on first 11 days (0-10), Val on rest (11+)
@@ -169,9 +201,21 @@ def setup_system(packages_df, scans_df, calendar_df):
     train_ds = LogisticsDataset(train_df, scans_df[scans_df['PackageID'].isin(train_ids)], None, maps)
     val_ds = LogisticsDataset(val_df, scans_df[scans_df['PackageID'].isin(val_ids)], None, maps)
     
-    loaders = {'train': DataLoader(train_ds, batch_size=128, shuffle=True), 'val': DataLoader(val_ds, batch_size=128)}
+    train_fail_rate = float(train_df['FailedService'].mean())
+    global_pos_weight = (1.0 - train_fail_rate) / max(train_fail_rate, 1e-6)
+    global_pos_weight = max(1.0, global_pos_weight)
+
+    loaders = {
+        'train': DataLoader(train_ds, batch_size=128, shuffle=True),
+        'val': DataLoader(val_ds, batch_size=128),
+        'loss_cfg': {
+            'global_pos_weight': float(global_pos_weight),
+            'step_pos_weight': float(global_pos_weight),
+            'mono_weight': 0.5,
+        },
+    }
     
-    config = DCLTConfig(len(maps['loc']), len(maps['event']), len(maps['lane']))
+    config = DCLTConfig(len(maps['loc']) + 1, len(maps['event']) + 1, len(maps['lane']) + 1)
     model = DeepContextualLogisticsTransformer(config).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=0.01)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=3, gamma=0.1)

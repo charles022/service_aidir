@@ -131,5 +131,11 @@ def run_simulation():
         'Is_Failure_Trigger': 'max',
         'StartDay': 'first'
     }).reset_index().rename(columns={'Is_Failure_Trigger': 'FailedService'})
-    
-    return df_packages, df_scans, None, None
+
+    failed_pkg_ids = set(df_packages.loc[df_packages['FailedService'] == 1, 'PackageID'])
+    triggers = df_scans[
+        (df_scans['Is_Failure_Trigger'] == 1) & (df_scans['PackageID'].isin(failed_pkg_ids))
+    ][['PackageID', 'ScanTime']].copy()
+    trigger_info = triggers.rename(columns={'ScanTime': 'Trigger_Time'}).groupby('PackageID').first().reset_index()
+
+    return df_packages, df_scans, trigger_info, None

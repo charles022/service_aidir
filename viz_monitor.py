@@ -150,6 +150,7 @@ def calculate_metrics(preds, targets):
 def execute_training(model, optimizer, loaders, device, epochs=5, config=None, scheduler=None):
     monitor = DarkMonitor(config=config)
     print(f"Logging training data to: {monitor.log_dir}")
+    loss_cfg = loaders.get('loss_cfg', {})
     
     for epoch in range(epochs):
         start_time = time.time()
@@ -163,7 +164,9 @@ def execute_training(model, optimizer, loaders, device, epochs=5, config=None, s
             batch = {k: v.to(device) for k, v in batch.items()}
             optimizer.zero_grad()
             s_risk, g_risk = model(batch)
-            loss = build_train_model.risk_velocity_loss(s_risk, g_risk, batch['label'], batch['mask'])
+            loss = build_train_model.risk_velocity_loss(
+                s_risk, g_risk, batch['label'], batch['mask'], **loss_cfg
+            )
             loss.backward()
             grad = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
@@ -190,7 +193,9 @@ def execute_training(model, optimizer, loaders, device, epochs=5, config=None, s
             for i, batch in enumerate(loaders['val']):
                 batch = {k: v.to(device) for k, v in batch.items()}
                 s_risk, g_risk = model(batch)
-                val_sum += build_train_model.risk_velocity_loss(s_risk, g_risk, batch['label'], batch['mask']).item()
+                val_sum += build_train_model.risk_velocity_loss(
+                    s_risk, g_risk, batch['label'], batch['mask'], **loss_cfg
+                ).item()
                 
                 val_preds.extend(g_risk.cpu().numpy())
                 val_targets.extend(batch['label'].cpu().numpy())
